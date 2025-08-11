@@ -4,8 +4,12 @@ services:
     env: python
     plan: free
     autoDeploy: true
-    buildCommand: pip install -r requirements.txt
+    rootDir: notebookLM-backend
+    buildCommand: |
+      python --version
+      pip install -r requirements.txt
     startCommand: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
     envVars:
       - key: SUPABASE_URL
         sync: false
@@ -15,5 +19,7 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
+      - key: PIP_ONLY_BINARY
+        value: "PyMuPDF"
       - key: DEBUG
         value: "false"
