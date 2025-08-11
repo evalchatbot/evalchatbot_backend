@@ -6,7 +6,7 @@ supabase==2.0.2
 langchain==0.1.0
 langchain-community==0.0.10
 langchain-groq==0.0.1
-fastembed==0.2.0
+fastembed==0.7.1
 pypdf2==3.0.1
 pymupdf==1.23.8
 python-dotenv==1.0.0
