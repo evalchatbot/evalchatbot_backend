@@ -1,247 +1,124 @@
-from typing import List, Dict, Optional
+import fitz  # PyMuPDF
+import PyPDF2
+from typing import List, Dict, Tuple
+import re
+from fastembed import TextEmbedding
+import numpy as np
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 import logging
-from .rag_service import RAGService
-from .supabase_service import SupabaseService
-from ..models.database import ChatRequest, ChatResponse, Notebook
 
 logger = logging.getLogger(__name__)
 
-class ChatService:
-    def __init__(self, rag_service: RAGService, supabase_service: SupabaseService):
-        self.rag_service = rag_service
-        self.supabase_service = supabase_service
+class DocumentProcessor:
+    def __init__(self, embedding_model: str = "BAAI/bge-small-en-v1.5"):
+        self.embedding_model = TextEmbedding(embedding_model)
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""]
+        )
     
-    async def process_chat(self, chat_request: ChatRequest) -> ChatResponse:
+    def extract_text_from_pdf(self, file_path: str) -> List[Tuple[str, int]]:
         """
-        Main chat processing pipeline
+        Extract text from PDF with page numbers
+        Returns: List of (text, page_number) tuples
         """
         try:
-            # Get notebook details
-            notebook = await self.supabase_service.get_notebook_by_id(chat_request.notebook_id)
-            if not notebook:
-                raise ValueError(f"Notebook {chat_request.notebook_id} not found")
+            doc = fitz.open(file_path)
+            pages = []
             
-            # Get available chunks for the selected books
-            available_chunks = await self._get_available_chunks(notebook)
-            if not available_chunks:
-                return ChatResponse(
-                    response="I don't have access to any documents in this notebook. Please select some books or genres first.",
-                    citations=[],
-                    memory_summary=notebook.get("memory_summary", ""),
-                    key_facts=notebook.get("key_facts", [])
-                )
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                text = page.get_text()
+                
+                # Clean text
+                text = self._clean_text(text)
+                if text.strip():
+                    pages.append((text, page_num + 1))
             
-            # Search for relevant chunks
-            relevant_chunks = self.rag_service.search_similar_chunks(
-                chat_request.message, 
-                available_chunks, 
-                top_k=5
-            )
-            
-            if not relevant_chunks:
-                return ChatResponse(
-                    response="I couldn't find any relevant information in the selected documents to answer your question. Please try rephrasing or ask about a different topic.",
-                    citations=[],
-                    memory_summary=notebook.get("memory_summary", ""),
-                    key_facts=notebook.get("key_facts", [])
-                )
-            
-            # Create context from chunks
-            context = self.rag_service.create_context_from_chunks(relevant_chunks)
-            
-            # Get chat history for context
-            chat_history = await self.supabase_service.get_chat_history(chat_request.notebook_id, limit=10)
-            
-            # Generate response
-            rag_response = self.rag_service.generate_response(
-                chat_request.message,
-                context,
-                self._format_chat_history(chat_history)
-            )
-            
-            # Extract citations from chunks
-            citations = self._extract_citations(relevant_chunks)
-            
-            # Update notebook memory
-            new_memory_summary = await self._update_notebook_memory(
-                notebook, 
-                chat_request.message, 
-                rag_response["response"]
-            )
-            
-            # Extract key facts
-            new_key_facts = self.rag_service.extract_key_facts({
-                "question": chat_request.message,
-                "answer": rag_response["response"]
-            })
-            
-            # Save chat message
-            await self.supabase_service.save_chat_message({
-                "notebook_id": chat_request.notebook_id,
-                "user_message": chat_request.message,
-                "assistant_response": rag_response["response"],
-                "citations": citations
-            })
-            
-            # Update notebook with new memory and facts
-            await self.supabase_service.update_notebook_memory(
-                chat_request.notebook_id,
-                new_memory_summary,
-                new_key_facts
-            )
-            
-            return ChatResponse(
-                response=rag_response["response"],
-                citations=citations,
-                memory_summary=new_memory_summary,
-                key_facts=new_key_facts
-            )
+            doc.close()
+            return pages
             
         except Exception as e:
-            logger.error(f"Error processing chat: {e}")
-            return ChatResponse(
-                response="I apologize, but I encountered an error while processing your request. Please try again.",
-                citations=[],
-                memory_summary="",
-                key_facts=[]
-            )
+            logger.error(f"Error processing PDF {file_path}: {e}")
+            raise
     
-    async def _get_available_chunks(self, notebook: Dict) -> List[Dict]:
+    def _clean_text(self, text: str) -> str:
+        """Clean and normalize text"""
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text)
+        # Remove special characters but keep basic punctuation
+        text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)\[\]\{\}]', '', text)
+        return text.strip()
+    
+    def create_chunks(self, pages: List[Tuple[str, int]]) -> List[Dict]:
         """
-        Get all available chunks for the notebook's selected books and genres
+        Create chunks from pages with metadata
+        Returns: List of chunk dictionaries
+        """
+        chunks = []
+        chunk_index = 0
+        
+        for page_text, page_num in pages:
+            # Split page into chunks
+            page_chunks = self.text_splitter.split_text(page_text)
+            
+            for i, chunk_text in enumerate(page_chunks):
+                chunk = {
+                    "content": chunk_text,
+                    "page_start": page_num,
+                    "page_end": page_num,
+                    "chunk_index": chunk_index,
+                    "metadata": {
+                        "page_number": page_num,
+                        "chunk_in_page": i,
+                        "total_chunks_in_page": len(page_chunks)
+                    }
+                }
+                chunks.append(chunk)
+                chunk_index += 1
+        
+        return chunks
+    
+    def generate_embeddings(self, chunks: List[Dict]) -> List[Dict]:
+        """
+        Generate embeddings for chunks
+        Returns: List of chunks with embeddings
         """
         try:
-            book_ids = notebook.get("selected_books", [])
-            genres = notebook.get("selected_genres", [])
+            # Extract text content for embedding
+            texts = [chunk["content"] for chunk in chunks]
             
-            # Get chunks for specific books
-            chunks = []
-            if book_ids:
-                book_chunks = await self.supabase_service.get_chunks_by_book_ids(book_ids)
-                chunks.extend(book_chunks)
+            # Generate embeddings
+            embeddings = list(self.embedding_model.embed(texts))
             
-            # Get chunks for genres (if no specific books selected)
-            if not book_ids and genres:
-                for genre in genres:
-                    genre_books = await self.supabase_service.get_books_by_genre(genre)
-                    genre_book_ids = [book["id"] for book in genre_books]
-                    if genre_book_ids:
-                        genre_chunks = await self.supabase_service.get_chunks_by_book_ids(genre_book_ids)
-                        chunks.extend(genre_chunks)
-            
-            # Add book titles to chunks for better context
-            for chunk in chunks:
-                book = await self.supabase_service.get_book_by_id(chunk["book_id"])
-                if book:
-                    chunk["book_title"] = book["title"]
-                    chunk["book_author"] = book["author"]
+            # Add embeddings to chunks
+            for chunk, embedding in zip(chunks, embeddings):
+                chunk["embedding"] = embedding.tolist()
             
             return chunks
             
         except Exception as e:
-            logger.error(f"Error getting available chunks: {e}")
-            return []
+            logger.error(f"Error generating embeddings: {e}")
+            raise
     
-    def _format_chat_history(self, chat_history: List[Dict]) -> List[Dict]:
+    def process_document(self, file_path: str) -> List[Dict]:
         """
-        Format chat history for the LLM
+        Complete document processing pipeline
+        Returns: List of processed chunks with embeddings
         """
-        formatted_history = []
-        for msg in chat_history:
-            formatted_history.append({
-                "role": "user",
-                "content": msg["user_message"]
-            })
-            formatted_history.append({
-                "role": "assistant", 
-                "content": msg["assistant_response"]
-            })
-        return formatted_history
-    
-    def _extract_citations(self, chunks: List[Dict]) -> List[Dict]:
-        """
-        Extract citation information from chunks
-        """
-        citations = []
-        for chunk in chunks:
-            citation = {
-                "book_title": chunk.get("book_title", "Unknown Book"),
-                "book_author": chunk.get("book_author", "Unknown Author"),
-                "page_start": chunk.get("page_start", "?"),
-                "page_end": chunk.get("page_end", "?"),
-                "content_preview": chunk["content"][:100] + "..." if len(chunk["content"]) > 100 else chunk["content"]
-            }
-            citations.append(citation)
-        return citations
-    
-    async def _update_notebook_memory(
-        self, 
-        notebook: Dict, 
-        question: str, 
-        answer: str
-    ) -> str:
-        """
-        Update notebook memory with new conversation
-        """
-        try:
-            current_summary = notebook.get("memory_summary", "")
-            
-            new_memory = self.rag_service.update_memory_summary(
-                current_summary,
-                {"question": question, "answer": answer}
-            )
-            
-            return new_memory
-            
-        except Exception as e:
-            logger.error(f"Error updating notebook memory: {e}")
-            return notebook.get("memory_summary", "")
-    
-    async def create_notebook_session(
-        self, 
-        user_id: str, 
-        name: str, 
-        selected_books: List[str] = None, 
-        selected_genres: List[str] = None
-    ) -> Optional[Dict]:
-        """
-        Create a new notebook session
-        """
-        try:
-            notebook_data = {
-                "user_id": user_id,
-                "name": name,
-                "selected_books": selected_books or [],
-                "selected_genres": selected_genres or []
-            }
-            
-            notebook = await self.supabase_service.create_notebook(notebook_data)
-            return notebook
-            
-        except Exception as e:
-            logger.error(f"Error creating notebook session: {e}")
-            return None
-    
-    async def get_notebook_summary(self, notebook_id: str) -> Optional[Dict]:
-        """
-        Get notebook summary including memory and key facts
-        """
-        try:
-            notebook = await self.supabase_service.get_notebook_by_id(notebook_id)
-            if not notebook:
-                return None
-            
-            return {
-                "id": notebook["id"],
-                "name": notebook["name"],
-                "memory_summary": notebook.get("memory_summary", ""),
-                "key_facts": notebook.get("key_facts", []),
-                "selected_books": notebook.get("selected_books", []),
-                "selected_genres": notebook.get("selected_genres", []),
-                "created_at": notebook["created_at"],
-                "updated_at": notebook["updated_at"]
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting notebook summary: {e}")
-            return None
+        logger.info(f"Processing document: {file_path}")
+        
+        # Extract text from PDF
+        pages = self.extract_text_from_pdf(file_path)
+        logger.info(f"Extracted {len(pages)} pages")
+        
+        # Create chunks
+        chunks = self.create_chunks(pages)
+        logger.info(f"Created {len(chunks)} chunks")
+        
+        # Generate embeddings
+        chunks_with_embeddings = self.generate_embeddings(chunks)
+        logger.info(f"Generated embeddings for {len(chunks_with_embeddings)} chunks")
+        
+        return chunks_with_embeddings

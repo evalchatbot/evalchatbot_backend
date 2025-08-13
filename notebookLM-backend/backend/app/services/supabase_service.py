@@ -50,7 +50,18 @@ class SupabaseService:
         except Exception as e:
             logger.error(f"Error getting books by genre: {e}")
             return []
-    
+
+    async def get_books_by_ids(self, book_ids: List[str]) -> List[Dict]:
+        """Get multiple books by their IDs"""
+        try:
+            if not book_ids:
+                return []
+            result = self.supabase.table("books").select("*").in_("id", book_ids).execute()
+            return result.data if result.data else []
+        except Exception as e:
+            logger.error(f"Error getting books by IDs: {e}")
+            return []
+
     # Document chunk operations
     async def create_chunks(self, chunks: List[Dict]) -> List[Dict]:
         """Create multiple document chunks"""
@@ -88,17 +99,18 @@ class SupabaseService:
     
     async def search_chunks_vector(self, query_embedding: List[float], book_ids: List[str], top_k: int = 5) -> List[Dict]:
         """
-        Vector similarity search for chunks
-        Note: This is a simplified version. In production, you'd use pgvector extension
+        Performs vector similarity search for chunks using pgvector.
         """
         try:
-            # Get all chunks for the specified books
-            chunks = await self.get_chunks_by_book_ids(book_ids)
-            
-            # For now, return chunks with basic filtering
-            # In production, implement proper vector similarity search using pgvector
-            return chunks[:top_k]
-            
+            query = self.supabase.rpc(
+                'match_documents',
+                {
+                    'query_embedding': query_embedding,
+                    'match_count': top_k,
+                    'book_ids': book_ids
+                }
+            ).execute()
+            return query.data if query.data else []
         except Exception as e:
             logger.error(f"Error in vector search: {e}")
             return []
@@ -127,10 +139,16 @@ class SupabaseService:
             logger.error(f"Error creating notebook: {e}")
             raise
     
-    async def get_notebook_by_id(self, notebook_id: str) -> Optional[Dict]:
-        """Get notebook by ID"""
+    async def get_notebook_by_id(self, notebook_id: str, user_id: str = None) -> Optional[Dict]:
+        """Get notebook by ID, optionally filtering by user_id"""
         try:
-            result = self.supabase.table("notebooks").select("*").eq("id", notebook_id).execute()
+            logger.info(f"Getting notebook by id: {notebook_id} for user_id: {user_id}")
+            query = self.supabase.table("notebooks").select("*").eq("id", notebook_id)
+            if user_id:
+                query = query.eq("user_id", user_id)
+            
+            result = query.execute()
+            logger.info(f"Supabase result: {result}")
             return result.data[0] if result.data else None
         except Exception as e:
             logger.error(f"Error getting notebook: {e}")

@@ -1,10 +1,10 @@
 from typing import List, Dict, Optional
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 from langchain_groq import ChatGroq
 from langchain.schema import HumanMessage, SystemMessage
 import logging
 import os
+from fastembed import TextEmbedding
 
 logger = logging.getLogger(__name__)
 
@@ -14,47 +14,14 @@ class RAGService:
             groq_api_key=groq_api_key,
             model_name="llama3-8b-8192"  # Using Llama3-8B for cost efficiency
         )
+        self.embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5") # Initialize FastEmbed model
         self.system_prompt = """You are an intelligent assistant that helps users understand books and documents. 
         You can only answer questions based on the information provided in the context. 
         Always cite your sources by mentioning the book title and page numbers.
         If you don't have enough information to answer a question, say so clearly.
         Be helpful, accurate, and concise in your responses."""
     
-    def search_similar_chunks(
-        self, 
-        query: str, 
-        available_chunks: List[Dict], 
-        top_k: int = 5
-    ) -> List[Dict]:
-        """
-        Search for most similar chunks using cosine similarity
-        """
-        if not available_chunks:
-            return []
-        
-        try:
-            # Generate query embedding
-            query_embedding = self._generate_query_embedding(query)
-            
-            # Calculate similarities
-            similarities = []
-            for chunk in available_chunks:
-                chunk_embedding = np.array(chunk["embedding"])
-                similarity = cosine_similarity(
-                    [query_embedding], 
-                    [chunk_embedding]
-                )[0][0]
-                similarities.append((similarity, chunk))
-            
-            # Sort by similarity and return top_k
-            similarities.sort(key=lambda x: x[0], reverse=True)
-            top_chunks = [chunk for _, chunk in similarities[:top_k]]
-            
-            return top_chunks
-            
-        except Exception as e:
-            logger.error(f"Error in vector search: {e}")
-            return []
+    
     
     def _generate_query_embedding(self, query: str) -> np.ndarray:
         """
