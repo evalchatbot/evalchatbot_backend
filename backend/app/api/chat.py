@@ -1,11 +1,10 @@
 from fastapi import APIRouter, HTTPException, Depends
 from typing import List
 from ..models.database import ChatRequest, ChatResponse, NotebookCreate
-from ..services.chat_service import ChatService
 from ..services.rag_service import RAGService
+from ..services.chat_service import ChatService
 from ..services.supabase_service import SupabaseService
 import os
-
 router = APIRouter(prefix="/api", tags=["chat"])
 
 # Dependency injection

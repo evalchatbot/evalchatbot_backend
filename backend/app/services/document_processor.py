@@ -1,157 +1,124 @@
-from typing import List, Dict, Optional
-import numpy as np
-from langchain_groq import ChatGroq
-from langchain.schema import HumanMessage, SystemMessage
-import logging
-import os
+import fitz  # PyMuPDF
+import PyPDF2
+from typing import List, Dict, Tuple
+import re
 from fastembed import TextEmbedding
+import numpy as np
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import logging
 
 logger = logging.getLogger(__name__)
 
-class RAGService:
-    def __init__(self, groq_api_key: str):
-        self.llm = ChatGroq(
-            groq_api_key=groq_api_key,
-            model_name="llama3-8b-8192"  # Using Llama3-8B for cost efficiency
+class DocumentProcessor:
+    def __init__(self, embedding_model: str = "BAAI/bge-small-en-v1.5"):
+        self.embedding_model = TextEmbedding(embedding_model)
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""]
         )
-        self.embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5") # Initialize FastEmbed model
-        self.system_prompt = """You are an intelligent assistant that helps users understand books and documents. 
-        You can only answer questions based on the information provided in the context. 
-        Always cite your sources by mentioning the book title and page numbers.
-        If you don't have enough information to answer a question, say so clearly.
-        Be helpful, accurate, and concise in your responses."""
     
-    
-    
-    def _generate_query_embedding(self, query: str) -> np.ndarray:
+    def extract_text_from_pdf(self, file_path: str) -> List[Tuple[str, int]]:
         """
-        Generate embedding for the query using FastEmbed
+        Extract text from PDF with page numbers
+        Returns: List of (text, page_number) tuples
         """
         try:
-            # Generate embedding for the query
-            query_embedding = list(self.embedding_model.embed([query]))[0]
-            return query_embedding
+            doc = fitz.open(file_path)
+            pages = []
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                text = page.get_text()
+                
+                # Clean text
+                text = self._clean_text(text)
+                if text.strip():
+                    pages.append((text, page_num + 1))
+            
+            doc.close()
+            return pages
+            
         except Exception as e:
-            logger.error(f"Error generating query embedding: {e}")
-            # Fallback to random vector if embedding fails
-            return np.random.rand(384)
+            logger.error(f"Error processing PDF {file_path}: {e}")
+            raise
     
-    def create_context_from_chunks(self, chunks: List[Dict]) -> str:
+    def _clean_text(self, text: str) -> str:
+        """Clean and normalize text"""
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text)
+        # Remove special characters but keep basic punctuation
+        text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)\[\]\{\}]', '', text)
+        return text.strip()
+    
+    def create_chunks(self, pages: List[Tuple[str, int]]) -> List[Dict]:
         """
-        Create context string from retrieved chunks
+        Create chunks from pages with metadata
+        Returns: List of chunk dictionaries
         """
-        context_parts = []
+        chunks = []
+        chunk_index = 0
         
-        for chunk in chunks:
-            book_title = chunk.get("book_title", "Unknown Book")
-            page_start = chunk.get("page_start", "?")
-            page_end = chunk.get("page_end", "?")
+        for page_text, page_num in pages:
+            # Split page into chunks
+            page_chunks = self.text_splitter.split_text(page_text)
             
-            context_part = f"[From {book_title}, pages {page_start}-{page_end}]\n{chunk['content']}\n"
-            context_parts.append(context_part)
+            for i, chunk_text in enumerate(page_chunks):
+                chunk = {
+                    "content": chunk_text,
+                    "page_start": page_num,
+                    "page_end": page_num,
+                    "chunk_index": chunk_index,
+                    "metadata": {
+                        "page_number": page_num,
+                        "chunk_in_page": i,
+                        "total_chunks_in_page": len(page_chunks)
+                    }
+                }
+                chunks.append(chunk)
+                chunk_index += 1
         
-        return "\n".join(context_parts)
+        return chunks
     
-    def generate_response(
-        self, 
-        query: str, 
-        context: str, 
-        conversation_history: List[Dict] = None
-    ) -> Dict:
+    def generate_embeddings(self, chunks: List[Dict]) -> List[Dict]:
         """
-        Generate response using Groq LLM with context
+        Generate embeddings for chunks
+        Returns: List of chunks with embeddings
         """
         try:
-            # Build conversation context
-            messages = [SystemMessage(content=self.system_prompt)]
+            # Extract text content for embedding
+            texts = [chunk["content"] for chunk in chunks]
             
-            # Add conversation history if available
-            if conversation_history:
-                for msg in conversation_history[-5:]:  # Last 5 messages for context
-                    if msg["role"] == "user":
-                        messages.append(HumanMessage(content=msg["content"]))
-                    else:
-                        messages.append(SystemMessage(content=msg["content"]))
+            # Generate embeddings
+            embeddings = list(self.embedding_model.embed(texts))
             
-            # Add current query with context
-            query_with_context = f"""Context information:
-{context}
-
-User question: {query}
-
-Please answer based only on the context provided above. Include citations to specific books and page numbers."""
+            # Add embeddings to chunks
+            for chunk, embedding in zip(chunks, embeddings):
+                chunk["embedding"] = embedding.tolist()
             
-            messages.append(HumanMessage(content=query_with_context))
-            
-            # Generate response
-            response = self.llm.invoke(messages)
-            
-            return {
-                "response": response.content,
-                "context_used": context,
-                "chunks_retrieved": len(context.split("[From")) - 1
-            }
+            return chunks
             
         except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            return {
-                "response": "I apologize, but I encountered an error while processing your request. Please try again.",
-                "context_used": "",
-                "chunks_retrieved": 0
-            }
+            logger.error(f"Error generating embeddings: {e}")
+            raise
     
-    def update_memory_summary(
-        self, 
-        current_summary: str, 
-        new_conversation: Dict
-    ) -> str:
+    def process_document(self, file_path: str) -> List[Dict]:
         """
-        Update memory summary with new conversation
+        Complete document processing pipeline
+        Returns: List of processed chunks with embeddings
         """
-        try:
-            update_prompt = f"""Current summary: {current_summary}
-
-New conversation:
-Question: {new_conversation.get('question', '')}
-Answer: {new_conversation.get('answer', '')}
-
-Please update the summary to include key points from this new conversation. Keep it concise but comprehensive."""
-            
-            messages = [
-                SystemMessage(content="You are a helpful assistant that creates concise summaries."),
-                HumanMessage(content=update_prompt)
-            ]
-            
-            response = self.llm.invoke(messages)
-            return response.content
-            
-        except Exception as e:
-            logger.error(f"Error updating memory summary: {e}")
-            return current_summary
-    
-    def extract_key_facts(self, conversation: Dict) -> List[str]:
-        """
-        Extract key facts from a conversation
-        """
-        try:
-            extract_prompt = f"""From this conversation, extract 3-5 key facts or insights:
-
-Question: {conversation.get('question', '')}
-Answer: {conversation.get('answer', '')}
-
-Please list the key facts as bullet points."""
-            
-            messages = [
-                SystemMessage(content="You are a helpful assistant that extracts key facts."),
-                HumanMessage(content=extract_prompt)
-            ]
-            
-            response = self.llm.invoke(messages)
-            
-            # Parse response into list of facts
-            facts = [line.strip() for line in response.content.split('\n') if line.strip().startswith('-') or line.strip().startswith('•')]
-            return facts[:5]  # Limit to 5 facts
-            
-        except Exception as e:
-            logger.error(f"Error extracting key facts: {e}")
-            return []
+        logger.info(f"Processing document: {file_path}")
+        
+        # Extract text from PDF
+        pages = self.extract_text_from_pdf(file_path)
+        logger.info(f"Extracted {len(pages)} pages")
+        
+        # Create chunks
+        chunks = self.create_chunks(pages)
+        logger.info(f"Created {len(chunks)} chunks")
+        
+        # Generate embeddings
+        chunks_with_embeddings = self.generate_embeddings(chunks)
+        logger.info(f"Generated embeddings for {len(chunks_with_embeddings)} chunks")
+        
+        return chunks_with_embeddings
