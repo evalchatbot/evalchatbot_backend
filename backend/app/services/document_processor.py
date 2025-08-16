@@ -7,6 +7,7 @@ import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import logging
 
+# Configure logging
 logger = logging.getLogger(__name__)
 
 class DocumentProcessor:
